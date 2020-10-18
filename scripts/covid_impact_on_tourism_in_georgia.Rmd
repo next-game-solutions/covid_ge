@@ -1,0 +1,386 @@
+---
+title: "Estimating the impact of COVID-19 on international tourism in Georgia"
+author: "Sergey Mastitsky"
+date: "2020-10-18"
+output: html_document
+---
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = "center")
+
+require(dplyr)
+require(here)
+require(readr)
+require(tsibble)
+require(feasts)
+require(lubridate)
+require(ggplot2)
+require(bsts)
+require(brms)
+require(tidyr)
+require(RColorBrewer)
+```
+
+## Background
+
+Presented herein is the R code used to obtain the results descibed in the Medium article "Estimating the impact of COVID-19 on international tourism in Georgia". The period of interest covers the first 6 months since the onset of pandemic (March - August 2020).
+
+## Estimating the number of international travelers lost due to the pandemic
+
+### Data preparation
+
+The following data on monthly numbers of international travelers in Georgia were downloaded from the official website of [Georgian National Tourism Administration](https://gnta.ge/statistics/) and then re-formatted for easier analysis:
+
+```{r load-arrivals-data, message=FALSE}
+# Load data:
+dat <- read_csv(here("/data/international_travelers_ge.csv"))
+
+# Cleaning and other preparations:
+dat <- dat %>% 
+  mutate(ym = paste(year, month) %>% yearmonth(.)) %>% 
+  as_tsibble(., index = ym) %>% 
+  mutate(trips = trips / 100000, # express as 100K trips
+         trips_log = log(trips)) %>% 
+  dplyr::select(ym, trips, trips_log)
+
+dat
+
+# Pre-covid arrivals data:
+pre_covid_arrivals <- dat %>% filter(ym < yearmonth("2020 Mar"))
+
+# Training, validation and test sets:
+n_pre_covid <- nrow(pre_covid_arrivals)
+train <- pre_covid_arrivals[1:(n_pre_covid - 6), ]
+valid <- pre_covid_arrivals[(n_pre_covid - 5):n_pre_covid, ]
+test <- dat %>% dplyr::filter(ym >= yearmonth("2020 Mar"))
+```
+
+
+### Exploratory analysis
+
+The following graph shows monthly numbers of international travelers arriving in Georgia since January 2011 to August 2020:
+
+```{r arrivals-graph}
+ggplot(dat, aes(ym, trips)) +
+  geom_line() +
+  geom_vline(aes(xintercept = as.numeric(as.Date("2020-03-01"))),
+             col = "red", linetype = 2) +
+  theme_minimal() +
+  labs(x = "Time", 
+       y = "Number of international travelers\n(hundreds of thousands)")
+```
+
+As is clearly see from the above graph, the variance of the number of travelers has been increasing over time. To stabilise the variance and be able to fit an additive times series model, we will work with the log-transformed data:
+
+```{r arrivals-log}
+ggplot(dat, aes(ym, trips_log)) +
+  geom_line() +
+  theme_minimal() +
+  labs(x = "Time", y = "log[number of arrivals (hundreds of thousands)]")
+```
+
+The number of arrivals demonstrates a strong within-year seasonality, with peaks taking place in August:
+
+```{r arrivals-seasonality}
+train %>% gg_season(trips, pal = brewer.pal(6, "OrRd")) + 
+  theme_minimal() + 
+  labs(x = "Month", y = "International arrivals (hundreds of thousands)")
+```
+
+There is a strong autocorrelation in data, upto a log of ca. 3:
+
+```{r arrivals-autocorrelation}
+train %>% 
+  gg_lag(y = trips_log, geom = "point", lags = 1:6, alpha = 0.4) + 
+  theme_minimal()
+```
+
+### Model fitting
+
+The following two candidate models were fitted using the [`bsts` package](https://cran.r-project.org/web/packages/bsts/index.html):
+
+* `m0`: trend component + seasonal component + autoregressive component of order 3
+* `m1`: trend component + seasonal component + autoregressive component of order 1
+
+```{r arrivals-models, cache=TRUE}
+y <- train$trips_log
+
+ss <- list()
+ss <- AddLocalLinearTrend(ss, y)
+ss <- AddSeasonal(ss, y, nseasons = 12)
+ss <- AddAr(ss, y, lag = 3)
+m0 <- bsts(y, ss, niter = 5000, ping = 0, seed = 42)
+
+ss <- list()
+ss <- AddLocalLinearTrend(ss, y)
+ss <- AddSeasonal(ss, y, nseasons = 12)
+ss <- AddAr(ss, y, lag = 1)
+m1 <- bsts(y, ss, niter = 5000, ping = 0, seed = 42)
+```
+
+The quality of these models was evaluated using the mean absolute error, calculated on the validation dataset:
+
+```{r arrivals-mae}
+# Utility function to calculate MAE:
+mae <- function(observed, predicted){
+  mean(abs(observed - predicted))
+}
+
+# MAE for models m0 and m1:
+sapply(list("m0" = (predict(m0, horizon = 6) %>% .$median), 
+            "m1" = (predict(m1, horizon = 6) %>% .$median)), 
+       mae, observed = valid$trips_log)
+```
+
+Model `m0` provides a considerably lower prediction error. The following graph shows how the `m0`-predicted values agree with the actual observations from the validation dataset (notice that the model tends to slightly overestimate the number of travelers, although all the actual observations are within the 95% credideble intervals, and are thus plausible from this model's perspective):
+
+```{r m0-predictions}
+m0_pred <- predict(m0, horizon = 6)
+point_predictions <- tibble(ym = valid$ym,
+                            trips = exp(m0_pred$median),
+                            ll95 = exp(m0_pred$interval[1, ]),
+                            ul95 = exp(m0_pred$interval[2, ])) %>% 
+  as_tsibble(., index = ym)
+
+bind_rows(train, valid) %>% 
+  dplyr::filter(ym >= yearmonth("2015 Aug"),
+                ym < yearmonth("2019 Aug")) %>% 
+  ggplot(., aes(ym, trips)) + geom_line() +
+  geom_ribbon(data = point_predictions,
+              aes(ymin = ll95, ymax = ul95),
+              fill = "lightblue") +
+  geom_line(data = point_predictions, aes(ym, trips), col = "blue") +
+  geom_point(data = valid, col = "red") +
+  theme_minimal() +
+  ylim(c(0, NA)) +
+  labs(x = "Time", y = "Number of international arrivals (hundreds of thousands)")
+
+```
+
+We now combine the training and validation sets and fit the final model that will be used to forecast the number of international travelers that could be recorded in Georgia if 2020 were a normal year:
+
+```{r arrivals-final-model, cache=TRUE}
+# Fitting the final model for international travelers:
+y_full <- c(train$trips_log, valid$trips_log)
+ss <- list()
+ss <- AddLocalLinearTrend(ss, y_full)
+ss <- AddSeasonal(ss, y_full, nseasons = 12)
+ss <- AddAr(ss, y_full, lag = 3)
+m_final <- bsts(y_full, ss, niter = 5000, ping = 0, seed = 42)
+
+# Forecasting for the period of pandemic:
+m_final_pred <- predict(m_final, horizon = 6)
+
+# Plot the result:
+point_predictions <- tibble(ym = test$ym,
+                            trips = exp(m_final_pred$median),
+                            ll95 = exp(m_final_pred$interval[1, ]),
+                            ul95 = exp(m_final_pred$interval[2, ])) %>%
+  as_tsibble(., index = ym)
+
+bind_rows(train, valid) %>%
+  dplyr::filter(ym >= yearmonth("2015 Apr")) %>%
+  ggplot(., aes(ym, trips)) + geom_line() +
+  geom_ribbon(data = point_predictions,
+              aes(ymin = ll95, ymax = ul95),
+              fill = "lightblue") +
+  geom_line(data = point_predictions, col = "blue") + # predicted values
+  geom_point(data = point_predictions, col = "blue") +
+  geom_point(data = test, aes(ym, trips), col = "red") + # actual values
+  geom_line(data = test, aes(ym, trips), col = "red") +
+  theme_minimal() +
+  labs(x = "Time", y = "Number of international arrivals\n(hundreds of thousands)")
+```
+
+### Estimating the number of travelers lost due to the pandemic
+
+The numbers of international travelers lost due to the pandemic were estimated as pairwise differences between the model-predicted values and the actually observed values. Since the model is Bayesian, we can easily incorporate the uncertainty about its predictions into these calculations:
+
+```{r lost-arrivals, message=FALSE}
+# MCMC realisations of the predicted values:
+m_dist <- exp(m_final_pred$distribution) # exp to transform back to original scale
+
+# Pairwise differences:
+lost_trips <- apply(m_dist, 1, FUN = function(x){x - test$trips}) %>% 
+  t() %>% 
+  as_tibble(.name_repair = "minimal") %>% 
+  setNames(., c("Mar", "Apr", "May", "Jun", "Jul", "Aug")) %>% 
+  rowwise() %>% 
+  mutate(total = sum(c(Mar, Apr, May, Jun, Jul, Aug)))
+
+# Aggregate across MCMC realisations:
+(result_abs <- lost_trips %>%
+  dplyr::select(Mar:total) %>% 
+  pivot_longer(cols = Mar:total) %>% 
+  group_by(month = name) %>% 
+  summarise(tibble(
+    med = median(value),
+    ll95 = quantile(value, p = 0.025),
+    ul95 = quantile(value, p = 0.975))) %>% 
+  arrange(med))
+
+# Plot results:
+result_abs %>% 
+  dplyr::filter(month != "total") %>% 
+  mutate(month = factor(month, ordered = TRUE,
+                        levels = c("Mar", "Apr", "May", 
+                                   "Jun", "Jul", "Aug"))) %>% 
+  ggplot(., aes(month, med)) +
+  geom_point(size = 3) +
+  geom_hline(aes(yintercept = 0), linetype = 2, col = "gray60") +
+  geom_errorbar(aes(ymin = ll95, ymax = ul95), width = 0.1) +
+  theme_minimal() +
+  labs(x = "Year 2020", y = "Lost international travelers (hundreds of thousands)")
+```
+
+Thus, in the first 6 months since the onset of pandemic, Georgia has most likely lost ca. 4.61M international travelers (95% credible interval: 3.78 to 5.46 million), with the largest losses occurring in July and August.
+
+
+## Estimating the volume of foreign card transactions lost due to the pandemic
+
+### Data preparation
+
+The following data on monthly volumes of foreign card transactions (thousands of Georgian Laris, GEL) were similarly downloaded from the official website of [Georgian National Tourism Administration](https://gnta.ge/statistics/) and then were re-formatted for easier analysis:
+
+```{r cards-data, message=FALSE}
+(cards <- read_csv("../data/card_operations.csv") %>% 
+  pivot_longer(cols = y2007:y2020, names_to = "year", values_to = "volume") %>%
+  mutate(year = gsub("y", "", year)) %>% 
+  mutate(ym = paste(year, month) %>% yearmonth(.),
+         volume_log = log(volume)) %>% 
+  dplyr::select(ym, volume, volume_log) %>% 
+  as_tsibble(., index = ym) %>% 
+  filter(!is.na(volume)))
+```
+
+Preparing the data for modeling:
+
+```{r split-trnsactions-data, message=FALSE}
+# As foreign card transactions are likely to correlate with the
+# number of international arrivals, we'll combine the two datasets
+# for further analysis:
+cards <- left_join(dat, cards, by = "ym")
+
+# Pre-covid data:
+cards_pre <- cards %>% filter(ym < yearmonth("2020 Mar"))
+
+# Post covid data:
+cards_post <- cards %>% dplyr::filter(ym >= yearmonth("2020 Mar"))
+```
+
+
+### Exploratory analysis
+
+The following graph shows monthly volumes of the foreign card transactions from January 2011 to February 2020:
+
+```{r cards-graph, warning=FALSE, message=FALSE}
+ggplot(cards, aes(ym, volume/1000)) +
+  geom_line() +
+  geom_vline(aes(xintercept = as.numeric(as.Date("2020-03-01"))),
+             col = "red", linetype = 2) +
+  theme_minimal() +
+  labs(x = "Time", y = "Volume of transactions (millions of GEL)")
+```
+
+As is clearly seen from the above graph, the variance in the data has been increasing over time. Log-transformation helped to stabilise the variance:
+
+```{r cards-log, warning=FALSE}
+ggplot(cards, aes(ym, volume_log)) +
+  geom_line() +
+  theme_minimal() +
+  labs(x = "Time", y = "log[volume of transactions (thousands of GEL)]")
+```
+
+
+There was a strong positive correlation between the number of international travelers and the volume of foreign card transactions:
+
+```{r cards-correlation, warning=FALSE, message=FALSE, fig.width=8}
+cards_pre %>% 
+  ggplot(aes(trips_log, volume_log)) +
+  geom_point() + geom_smooth(method = "lm") +
+  facet_wrap(~year(ym), ncol = 5) +
+  theme_minimal()
+
+cards_pre %>% 
+  ggplot(aes(trips_log, volume_log, col = factor(year(ym)))) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal()
+
+cards_pre %>% 
+  dplyr::filter(ym >= yearmonth("2018 Jan")) %>% 
+  ggplot(aes(trips_log, volume_log)) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal() +
+  labs(x = "log(number of international travelers)",
+       y = "log(volume of foreign card transactions)")
+```
+
+
+### Modeling the volume of foreign card transactions
+
+As is seen from the graphs above, there was some variation in the strength of relationship between the (log) number of international travelers and (log) volume of foreign card transactions. To minimise the impact of such variation and account for the most recent trend and seasonality, only the data from 2018 and 2019 were used to fit a simple regression model to describe this relationship:
+
+```{r cards-reg}
+cards_reg <- lm(volume_log ~ trips_log, 
+                data = cards_pre, subset = ym >= yearmonth("2018 Jan"))
+
+summary(cards_reg)
+
+# Diagnostic plots:
+qqnorm(resid(cards_reg))
+plot(fitted(cards_reg), resid(cards_reg))
+```
+
+
+### Estimating the lost volume of card transactions
+
+As the Georgian National Tourism Administration hasn't yet published the actual volumes of foreign card transactions in March - August 2020, we first perform what is called "nowcasting" (i.e. forecasting an unobserved variable based on other, already observed, variables - in our case we predict the volume of card transactions based on the actually observed number of international arrivals):
+
+```{r cards-nowcasting}
+cards_nowcast <- predict(cards_reg, newdata = cards_post) %>% 
+  as_tibble() %>% 
+  setNames("volume_log") %>% 
+  mutate(ym = cards_post$ym,
+         volume = exp(volume_log))
+```
+
+And now we predict the volume of card transactions that could be observed in March - August if 2020 were a normal year. For simplicity, we'll use point estimates of the number of international arrivals (obtained using the model `m_final` - see above):
+
+```{r cards-forecasting}
+cards_forecast <- predict(cards_reg,
+                          newdata = tibble(trips_log = m_final_pred$median)) %>% 
+  as_tibble() %>% 
+  setNames("volume_log") %>% 
+  mutate(ym = cards_post$ym,
+         volume = exp(volume_log))
+```
+
+The resultant predictions are shown in the graph below (blue - forecast, red - nowcast): 
+
+```{r}
+cards_pre %>% 
+  dplyr::filter(ym >= yearmonth("2018 Jan"),
+                ym < yearmonth("2020 Mar")) %>% 
+  ggplot(., aes(ym, volume/1000)) + geom_line() +
+  geom_line(data = cards_forecast, aes(ym, volume/1000), col = "blue") +
+  geom_point(data = cards_forecast, aes(ym, volume/1000), col = "blue") +
+  geom_line(data = cards_nowcast, aes(ym, volume/1000), col = "red") +
+  geom_point(data = cards_nowcast, aes(ym, volume/1000), col = "red") +
+  theme_minimal() +
+  ylim(c(0, NA)) +
+  labs(x = "Time", y = "Volume of transactions (millions of GEL)")
+```
+
+
+The lost volume of foreign card transactions (millions of GEL) can be easily calculated by subtracting the nowcast- from the forecast-values:
+
+```{r cards-loss}
+(loss_gel <- sum(cards_forecast$volume - cards_nowcast$volume)*1000)
+```
+
+Assuming that 1 Georgian Lari buys 0.31 US dollars (as of October 2020), this is equivalent to ca. 338M USD:
+
+```{r cards-loss-usd}
+(loss_gel * 0.31)/1e6
+```
+
